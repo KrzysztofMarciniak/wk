@@ -1,6 +1,6 @@
 # wk (workkan) - file-based kanban
 
-!(wk)[wk.png]
+![wk](wk.png)
 
 `wk` is a tiny kanban board backed by directories and Markdown files. Columns are
 folders; tasks are files. There is no database, daemon, or custom task editor.
