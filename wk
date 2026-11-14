@@ -1,0 +1,214 @@
+#!/bin/sh
+# wk (workkan) - file-based kanban. Columns are directories; tasks are Markdown files.
+# Edit, move, and delete tasks with ordinary Unix tools.
+# BSD 3-Clause License
+# Copyright (c) 2026, KrzysztofMarciniak
+set -eu
+
+LC_ALL=C
+export LC_ALL
+
+die() {
+  printf 'wk: %s\n' "$*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'USAGE'
+wk init [column ...]          create .wk (default: todo doing done)
+wk add [-c column] title tier create a task; lower tiers sort first (0001 first)
+wk list [column]              list the board, optionally one column
+wk path <id-prefix>           print the matching task path
+wk export [file.tar.gz]       archive .wk
+
+Tasks are ordinary Markdown files. Move, edit, and delete them with:
+  mv "$(wk path a1b2)" .wk/doing/
+  "$EDITOR" "$(wk path a1b2)"
+  rm "$(wk path a1b2)"
+
+Set WK_DIR to use a board outside the current directory tree.
+USAGE
+}
+
+find_root() {
+  if [ -n "${WK_DIR:-}" ]; then
+    printf '%s\n' "${WK_DIR%/}"
+    return 0
+  fi
+
+  d=$PWD
+  while :; do
+    if [ -d "$d/.wk" ]; then
+      printf '%s\n' "$d/.wk"
+      return 0
+    fi
+    parent=$(dirname "$d")
+    [ "$parent" != "$d" ] || return 1
+    d=$parent
+  done
+}
+
+valid_col() {
+  wanted=$1
+  while IFS= read -r col; do
+    [ "$col" = "$wanted" ] && return 0
+  done < "$WK/columns"
+  die "no such column: $wanted"
+}
+
+list_col() {
+  col=$1
+  count=0
+  for f in "$WK/$col/"*.md; do
+    [ -f "$f" ] && count=$((count + 1))
+  done
+
+  printf '## %s (%s)\n' "$col" "$count"
+  for f in "$WK/$col/"*.md; do
+    [ -f "$f" ] || continue
+    base=${f##*/}
+    base=${base%.md}
+    tier=${base%%-*}
+    rest=${base#*-}
+    id=${rest%%-*}
+    printf '  %s  [%s] %s\n' "$id" "$tier" "$(head -n 1 "$f")"
+  done
+}
+
+cmd=${1:-list}
+[ "$#" -eq 0 ] || shift
+
+case "$cmd" in
+  help|-h|--help)
+    usage
+    exit 0
+    ;;
+  init)
+    [ ! -e .wk ] || die '.wk already exists'
+    [ "$#" -gt 0 ] || set -- todo doing done
+
+    seen=' '
+    for col in "$@"; do
+      case "$col" in
+        ''|.|..|*[!A-Za-z0-9_-]*) die "invalid column name: $col" ;;
+      esac
+      case "$seen" in
+        *" $col "*) die "duplicate column: $col" ;;
+      esac
+      seen="$seen$col "
+    done
+
+    mkdir .wk
+    : > .wk/columns
+    for col in "$@"; do
+      mkdir ".wk/$col"
+      : > ".wk/$col/.gitkeep"
+      printf '%s\n' "$col" >> .wk/columns
+    done
+    printf 'initialized .wk (%s)\n' "$*"
+    exit 0
+    ;;
+esac
+
+WK=$(find_root) || die 'no .wk found (run: wk init)'
+[ -f "$WK/columns" ] || die "invalid board: missing $WK/columns"
+
+case "$cmd" in
+  add)
+    col=$(head -n 1 "$WK/columns")
+    if [ "${1:-}" = '-c' ]; then
+      [ "$#" -ge 4 ] || die 'usage: wk add [-c column] title tier'
+      col=$2
+      shift 2
+    fi
+    valid_col "$col"
+    [ "$#" -ge 2 ] || die 'usage: wk add [-c column] title tier'
+
+    title=
+    while [ "$#" -gt 1 ]; do
+      if [ -n "$title" ]; then
+        title="$title $1"
+      else
+        title=$1
+      fi
+      shift
+    done
+    tier=$1
+    [ -n "$title" ] || die 'title required'
+
+    case "$tier" in
+      ''|*[!0-9]*) die 'tier must be a number from 0 to 9999' ;;
+    esac
+    [ "${#tier}" -le 4 ] || die 'tier must be a number from 0 to 9999'
+    while [ "${#tier}" -lt 4 ]; do tier="0$tier"; done
+
+    slug=$(printf '%s' "$title" |
+      tr '[:upper:]' '[:lower:]' |
+      tr -cs 'a-z0-9' '-' |
+      sed 's/^-//; s/-$//' |
+      cut -c1-40)
+    [ -n "$slug" ] || slug=task
+
+    while :; do
+      id=$(od -An -N3 -tx1 /dev/urandom | tr -d ' \n')
+      collision=no
+      for f in "$WK/"*/*-"$id"-*.md; do
+        [ -f "$f" ] && { collision=yes; break; }
+      done
+      [ "$collision" = no ] && break
+    done
+
+    file="$WK/$col/$tier-$id-$slug.md"
+    printf '%s\n' "$title" > "$file"
+    printf '%s\n' "$file"
+    ;;
+
+  list)
+    [ "$#" -le 1 ] || die 'usage: wk list [column]'
+    if [ "$#" -eq 1 ]; then
+      valid_col "$1"
+      list_col "$1"
+    else
+      while IFS= read -r col; do
+        list_col "$col"
+      done < "$WK/columns"
+    fi
+    ;;
+
+  path)
+    [ "$#" -eq 1 ] || die 'usage: wk path <id-prefix>'
+    case "$1" in
+      ''|*[!0-9a-f]*) die 'task ID prefix must be hexadecimal' ;;
+    esac
+    matches=0
+    found=
+    while IFS= read -r col; do
+      for f in "$WK/$col/"*.md; do
+        [ -f "$f" ] || continue
+        base=${f##*/}
+        base=${base%.md}
+        rest=${base#*-}
+        id=${rest%%-*}
+        case "$id" in
+          "$1"*) matches=$((matches + 1)); found=$f ;;
+        esac
+      done
+    done < "$WK/columns"
+    [ "$matches" -eq 1 ] || die "ID '$1' matched $matches tasks"
+    printf '%s\n' "$found"
+    ;;
+
+  export)
+    [ "$#" -le 1 ] || die 'usage: wk export [file.tar.gz]'
+    parent=$(dirname "$WK")
+    base=$(basename "$WK")
+    out=${1:-wk-$(date +%Y%m%d-%H%M%S).tar.gz}
+    tar -czf "$out" -C "$parent" "$base"
+    printf '%s\n' "$out"
+    ;;
+
+  *)
+    usage >&2
+    exit 1
+    ;;
+esac
